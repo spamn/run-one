@@ -1,4 +1,4 @@
-#!/bin/sh -e
+#!/bin/sh
 #
 #    run-one - run just one instance at a time of some command and
 #              unique set of arguments (useful for cronjobs, eg)
@@ -13,9 +13,11 @@
 #    run-one-until-failure - run-one, but respawn until an unsuccessful exit
 #
 #    Copyright (C) 2010-2013 Dustin Kirkland <kirkland@ubuntu.com>
+#    Copyright (C) 2016 Nicolas Fleury <github@fleuryn.fr>
 #
 #    Authors:
 #        Dustin Kirkland <kirkland@ubuntu.com>
+#        Nicolas Fleury <github@fleuryn.fr>
 #
 #    This program is free software: you can redistribute it and/or modify
 #    it under the terms of the GNU General Public License as published by
@@ -54,60 +56,175 @@ else
 fi
 mkdir -p "$DIR"
 
+base="$(basename $0)"
+#TODO: keep former functionality by setting the proper variable
+case $base in
+	run-this-one)
+		REPLACE=1
+		;;
+	keep-one-running|run-one-constantly)
+		KEEP_RUNNING=1
+		;;
+	run-one-until-success)
+		KEEP_RUNNING=1
+		RERUN_TILL_SUCCESS=1
+		;;
+	run-one-until-failure)
+		KEEP_RUNNING=1
+		RERUN_TILL_FAILURE=1
+		;;
+esac
+
+while [[ $# -gt 1 ]]; do
+opt="$1"
+
+case $opt in
+	--timeout=*)
+		TIMEOUT_SECONDS="${opt#*=}"
+		;;
+	--timeout)
+		TIMEOUT_SECONDS="$2"
+		shift
+		;;
+	-K|--force-kill)
+		FORCE_KILL=1
+		;;
+	-r|--replace)
+		REPLACE=1
+		;;
+	-t|--toggle)
+		TOGGLE=1
+		;;
+	-f|--stop-on-failure)
+		KEEP_RUNNING=1
+		RERUN_TILL_FAILURE=1
+		;;
+	-s|--stop-on-success)
+		KEEP_RUNNING=1
+		RERUN_TILL_SUCCESS=1
+		;;
+	-k|--keep-running)
+		KEEP_RUNNING=1
+		;;
+	--skip-arguments)
+		SKIP_ARGUMENTS=1
+		;;
+	*)
+		break ;;
+esac
+shift
+done
+
+if [ -z "$TIMEOUT_SECONDS" ] ; then
+	TIMEOUT_SECONDS=5
+fi
+
+if [ $# -eq 0 ]; then
+	echo "ERROR: no arguments specified" 1>&2
+	exit 1
+fi
+
+#TODO: check options coherency
+
 # Calculate the hash of the command and arguments
 CMD="$@"
-CMDHASH=$(echo "$CMD" | md5sum | awk '{print $1}')
+if [ "$SKIP_ARGUMENTS" == 1 ] ; then
+	CMDHASH=$(echo "$0" | md5sum | awk '{print $1}')
+else
+	CMDHASH=$(echo "$CMD" | md5sum | awk '{print $1}')
+fi
 FLAG="$DIR/$CMDHASH"
 
-base="$(basename $0)"
-case "$base" in
-	run-one)
-		# Run the specified command, assuming we can flock this command string's hash
-		flock -xn "$FLAG" "$@"
-	;;
-	run-this-one)
-		ps="$CMD"
-		# Loop through matching pids
-		for p in $(pgrep -u "$USER" -f "^$ps$" || true); do
-			# Try to kill pid
-			kill $p
-			# And then block until killed
-			while ps $p >/dev/null 2>&1; do
-				kill $p
-				sleep 1
-			done
+if [ "$REPLACE" == "1" ] || [ "$TOGGLE" == "1" ] ; then
+	if [ -r "$FLAG" ] ; then
+		pid=$(head -n 1 $FLAG)
+	fi
+	flock -xn $FLAG true ||
+	if [ -n "$pid" ] && ps $pid >/dev/null 2>&1; then
+		FOUND_CMD=1
+		kill $pid
+		((TIMEOUT_SECONDS*=2))
+		while [ $TIMEOUT_SECONDS -gt 0 ] && ps $pid >/dev/null 2>&1; do
+			kill $pid > /dev/null 2>&1
+			sleep 0.5
+			((TIMEOUT_SECONDS--))
 		done
-		# Also try to use lsof, but it seems that flock()'s
-		# are not always persistent enough, so this is purely auxilliary.
-		pid=$(lsof "$FLAG" 2>/dev/null | awk '{print $2}' | grep "^[0-9]") || true
-		[ -z "$pid" ] || kill $pid
-		sleep 0.5
-		# Run the specified command, assuming we can flock this command string's hash
-		flock -xn "$FLAG" "$@"
-	;;
-	keep-one-running|run-one-constantly|run-one-until-success|run-one-until-failure)
-		backoff=0
-		retries=0
-		while true; do
-			# Run the specified command, assuming we can flock this command string's hash
-			set +e
-			flock -xn "$FLAG" "$@"
-			if [ "$?" = 0 ]; then
-				# If we were waiting for success, we're done
-				[ "$base" = "run-one-until-success" ] && exit $?
-				# Last run finished successfully, reset to minimum back-off of 1 second
-				backoff=0
-			else
-				# If we were waiting for failure, we're done
-				[ "$base" = "run-one-until-failure" ] && exit $?
-				# Last run failed, so slow down the retries
-				retries=$((retries + 1))
-				backoff=$((retries / 10))
-				logger -t "${base}[$$]" "last run failed; sleeping [$backoff] seconds before next run"
-			fi
-			# Don't sleep more than 60 seconds
-			[ $backoff -gt 60 ] && backoff=60
-			sleep $backoff
+		if [ "$FORCE_KILL" == "1" ] ; then
+			kill -9 $p
+			sleep 0.1
+		fi
+		if ps $pid >/dev/null 2>&1; then
+			ps $pid
+			echo "Fail killing process with pid $pid"
+		fi
+	fi
+fi
+
+if [ "$FOUND_CMD" == "1" ] &&  [ "$TOGGLE" == "1" ] ; then
+	exit 0
+fi
+
+function cleanup
+{
+	pid=$(head -n 1 $FLAG | cut -d' ' -f1)
+	timeout=10
+	if [ -n $pid ] && [ $pid -gt 0 ]; then
+		echo -n "Killing: $(tail -n 1 $FLAG) nicely " ;
+		while ps $pid >/dev/null 2>&1 && [ $timeout -gt 0 ] ; do
+			kill $pid
+			sleep 0.5
+			((timeout -= 1))
+			echo -n "."
 		done
-	;;
-esac
+		echo
+		if ps $pid >/dev/null 2>&1; then
+			echo "Nice kill failed, using SIGKILL"
+			kill -9 $pid
+		fi
+	fi
+	rm $FLAG
+	exit
+}
+
+backoff=0
+retries=0
+(
+flock -w 3 9 || { echo "Another instance is already running:" ; cat $FLAG ; exit 1 ; }
+trap cleanup  SIGHUP SIGINT SIGTERM
+if [ "$KEEP_RUNNING" == "1" ] ; then
+	while true; do
+		echo TEST
+		# Run the specified command, assuming we can flock this command string's hash
+		#set +e
+		"$@" &
+		SUBPROCESS_PID=$!
+		echo $SUBPROCESS_PID $$ > $FLAG
+		echo "$@" >> $FLAG
+		wait $SUBPROCESS_PID
+		if [ "$?" = 0 ]; then
+			# If we were waiting for success, we're done
+			[ "$RERUN_TILL_SUCCESS" = "1" ] && exit $?
+			# Last run finished successfully, reset to minimum back-off of 1 second
+			backoff=0
+		else
+			# If we were waiting for failure, we're done
+			[ "$RERUN_TILL_FAILURE" = "1" ]  && exit $?
+			# Last run failed, so slow down the retries
+			retries=$((retries + 1))
+			backoff=$((retries / 10))
+			logger -t "${base}[$$]" "last run failed; sleeping [$backoff] seconds before next run"
+		fi
+		# Don't sleep more than 60 seconds
+		[ $backoff -gt 60 ] && backoff=60
+		sleep $backoff &
+		wait $!
+	done
+else
+	"$@" &
+	SUBPROCESS_PID=$!
+	echo $SUBPROCESS_PID $$ > $FLAG
+	echo "$@" >> $FLAG
+	wait $SUBPROCESS_PID
+fi
+rm -f $FLAG
+) 9>>$FLAG
